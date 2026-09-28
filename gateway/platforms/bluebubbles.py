@@ -24,7 +24,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from .media_cache import ext_for_mime
-from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for the shared dispatch in
@@ -64,6 +64,12 @@ _ADDRESS_RE = re.compile(r"^\+\d+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
+
+# Inbound webhook dedup: BlueBubbles re-delivers a webhook after a reconnect/resume, so the same
+# message guid can arrive twice. A TTL cache (a MessageDeduplicator, so the runner's reconnect
+# handover adopts its live ids into a rebuilt adapter) drops the replay before it reaches the agent.
+_BLUEBUBBLES_DEDUP_WINDOW_SECONDS = 48 * 3600  # re-accept an id older than 48h
+_BLUEBUBBLES_DEDUP_MAX_SIZE = 2000             # hard bound on cached ids
 
 
 def _redact(text: str) -> str:
@@ -131,6 +137,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._dedup = MessageDeduplicator(
+            max_size=_BLUEBUBBLES_DEDUP_MAX_SIZE, ttl_seconds=_BLUEBUBBLES_DEDUP_WINDOW_SECONDS)
 
     # --- API helpers ---
 
@@ -577,6 +585,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return _ok()
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
+            return _ok()
+        # Inbound dedup: a replayed guid (webhook retry / reconnect replay) is acknowledged and
+        # never reaches handle_message. `self._dedup` is a MessageDeduplicator so the runner's
+        # reconnect handover (carry_inbound_dedup) adopts its live ids into the rebuilt adapter.
+        inbound_id = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
+        if inbound_id and self._dedup.is_duplicate(inbound_id):
+            logger.debug("[bluebubbles] dropped duplicate inbound message %s", _redact(inbound_id))
             return _ok()
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
