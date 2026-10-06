@@ -231,6 +231,36 @@ class TestBlueBubblesGuidResolution:
         assert "user@example.com" not in adapter._guid_cache
 
 
+    @pytest.mark.asyncio
+    async def test_spam_filtered_chat_is_not_resolved(self, monkeypatch):
+        """A spam-filtered thread must never be chosen, even when it matches the handle.
+
+        iMessage keeps an auto-spam-reported chat beside the real DM for the same handle, and
+        sending to the filtered GUID fails with a 500 from the BlueBubbles server. The filtered
+        entry is listed first here, so resolving it means the guard is missing.
+        """
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_api_post(path, payload):
+            return {
+                "data": [
+                    {
+                        "guid": "iMessage;-;+15622212244-filtered",
+                        "chatIdentifier": "+15622212244",
+                        "isFiltered": True,
+                    },
+                    {
+                        "guid": "iMessage;-;+15622212244",
+                        "chatIdentifier": "+15622212244",
+                    },
+                ]
+            }
+
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        result = await adapter._resolve_chat_guid("+15622212244")
+        assert result == "iMessage;-;+15622212244"
+
+
 class TestBlueBubblesAttachmentDownload:
     """Verify _download_attachment routes to the correct cache helper."""
 
@@ -583,3 +613,77 @@ class TestBlueBubblesGateBeforeDownload:
         assert response.status == 200
         assert download.await_count == downloads
         assert len(handled) == handled_count
+
+
+class TestBlueBubblesInboundDedup:
+    """BlueBubbles re-delivers a webhook after a reconnect/resume; the replay must not reach the
+    agent a second time."""
+
+    @pytest.mark.asyncio
+    async def test_replayed_webhook_is_dispatched_once(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "data": {
+                "guid": "msg-replay-1",
+                "text": "hello",
+                "handle": {"address": "+15622212244"},
+                "chatGuid": "iMessage;-;+15622212244",
+                "chatIdentifier": "+15622212244",
+                "isFromMe": False,
+            },
+        }
+
+        first = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        second = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+
+        assert first.status == 200 and second.status == 200
+        assert len(handled) == 1, "a replayed webhook guid must not be dispatched twice"
+
+    @pytest.mark.asyncio
+    async def test_distinct_webhooks_are_both_dispatched(self, monkeypatch):
+        """Dedup must key on the message id, not drop everything after the first message."""
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        for guid in ("msg-1", "msg-2"):
+            await adapter._handle_webhook(_FakeBlueBubblesRequest({
+                "type": "new-message",
+                "data": {
+                    "guid": guid,
+                    "text": "hello",
+                    "handle": {"address": "+15622212244"},
+                    "chatGuid": "iMessage;-;+15622212244",
+                    "chatIdentifier": "+15622212244",
+                    "isFromMe": False,
+                },
+            }))
+        await asyncio.sleep(0)
+
+        assert len(handled) == 2
+
+    def test_dedup_cache_survives_an_adapter_rebuild(self, monkeypatch):
+        """The runner's reconnect path builds a NEW adapter, so ``carry_inbound_dedup`` must adopt
+        the predecessor's live ids — otherwise the replay the fix is meant to catch starts being
+        admitted again at exactly the moment a reconnect makes it likely."""
+        from gateway.platforms.helpers import carry_inbound_dedup
+
+        predecessor = _make_adapter(monkeypatch)
+        assert predecessor._dedup.is_duplicate("msg-replayed-across-reconnect") is False
+
+        rebuilt = _make_adapter(monkeypatch)
+        assert rebuilt._dedup.is_duplicate("msg-replayed-across-reconnect") is False  # fresh cache
+
+        carry_inbound_dedup(predecessor, rebuilt)
+        assert rebuilt._dedup.is_duplicate("msg-replayed-across-reconnect") is True
